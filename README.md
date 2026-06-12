@@ -18,11 +18,13 @@ To create a new Next.js app, run the following command:
 npx create-next-app chatbot
 ```
 
-Next, we'll add the `ai` package:
+Next, we'll add the `ai` package along with the OpenAI provider for the Vercel AI SDK:
 
 ```bash
-npm install ai
+pnpm add ai @ai-sdk/openai
 ```
+
+> This repository uses **pnpm** as its package manager. You can use `npm` or `yarn`, but the lockfile and CI are based on pnpm.
 
 You can use the [full list](https://github.com/pinecone-io/pinecone-vercel-example/blob/main/package.json) of dependencies if you'd like to build along with the tutorial.
 
@@ -144,21 +146,12 @@ The useful `useChat` hook will manage the state for the messages displayed in th
 Next, we'll set up the Chatbot API endpoint. This is the server-side component that will handle requests and responses for our chatbot. We'll create a new file called `api/chat/route.ts` and add the following dependencies:
 
 ```ts
-import { Configuration, OpenAIApi } from "openai-edge";
-import { Message, OpenAIStream, StreamingTextResponse } from "ai";
+import { Message } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { streamText } from "ai";
 ```
 
-The first dependency is the `openai-edge` package which makes it easier to interact with OpenAI's APIs in an edge environment. The second dependency is the `ai` package which we'll use to define the `Message` and `OpenAIStream` types, which we'll use to stream back the response from OpenAI back to the client.
-
-Next initialize the OpenAI client:
-
-```ts
-// Create an OpenAI API client (that's edge friendly!)
-const config = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-const openai = new OpenAIApi(config);
-```
+We use the [Vercel AI SDK](https://sdk.vercel.ai): the `@ai-sdk/openai` provider wraps OpenAI's chat models, and `streamText` from the `ai` package streams the completion back to the client in an edge-friendly way. The OpenAI client reads `OPENAI_API_KEY` from the environment automatically — no manual client initialization is required.
 
 To define this endpoint as an edge function, we'll define and export the `runtime` variable
 
@@ -187,25 +180,23 @@ export async function POST(req: Request) {
     ];
 
     // Ask OpenAI for a streaming chat completion given the prompt
-    const response = await openai.createChatCompletion({
-      model: "gpt-3.5-turbo",
-      stream: true,
+    const result = await streamText({
+      model: openai("gpt-4o"),
       messages: [
         ...prompt,
         ...messages.filter((message: Message) => message.role === "user"),
       ],
     });
-    // Convert the response into a friendly text-stream
-    const stream = OpenAIStream(response);
+
     // Respond with the stream
-    return new StreamingTextResponse(stream);
+    return result.toDataStreamResponse();
   } catch (e) {
     throw e;
   }
 }
 ```
 
-Here we deconstruct the messages from the post, and create our initial prompt. We use the prompt and the messages as the input to the `createChatCompletion` method. We then convert the response into a stream and return it to the client. Note that in this example, we only send the user's messages to OpenAI (as opposed to including the bot's messages as well).
+Here we deconstruct the messages from the post, and create our initial prompt. We pass the prompt and the messages to `streamText`, then return the result as a data stream response to the client. Note that in this example, we only send the user's messages to OpenAI (as opposed to including the bot's messages as well).
 
 <!-- Add snapshot of simple chat -->
 
@@ -307,7 +298,7 @@ The helper methods fetchPage, parseHtml, and extractUrls respectively handle fet
 To tie things together, we'll create a seed function that will use the crawler to seed the knowledge base. In this portion of the code, we'll initialize the crawl and fetch a given URL, then split it's content into chunks, and finally embed and index the chunks in Pinecone.
 
 ```ts
-async function seed(url: string, limit: number, indexName: string, options: SeedOptions) {
+async function seed(url: string, limit: number, indexName: string, cloudName: ServerlessSpecCloudEnum, regionName: string, options: SeedOptions) {
   try {
     // Initialize the Pinecone client
     const pinecone = new Pinecone();
@@ -329,13 +320,19 @@ async function seed(url: string, limit: number, indexName: string, options: Seed
     const documents = await Promise.all(pages.map(page => prepareDocument(page, splitter)));
 
     // Create Pinecone index if it does not exist
-    const indexList = await pinecone.listIndexes();
-    const indexExists = indexList.some(index => index.name === indexName)
+    const indexList: string[] = (await pinecone.listIndexes())?.indexes?.map(index => index.name) || [];
+    const indexExists = indexList.includes(indexName);
     if (!indexExists) {
       await pinecone.createIndex({
         name: indexName,
         dimension: 1536,
         waitUntilReady: true,
+        spec: {
+          serverless: {
+            cloud: cloudName,
+            region: regionName
+          }
+        }
       });
     }
 
@@ -356,6 +353,8 @@ async function seed(url: string, limit: number, indexName: string, options: Seed
 }
 ```
 
+The index is created as a **serverless** index, so `seed` takes the target `cloud` and `region` (read from `PINECONE_CLOUD` / `PINECONE_REGION`). The dimension is `1536` to match the `text-embedding-ada-002` embedding model.
+
 To chunk the content we'll use one of the following methods:
 
 1. `RecursiveCharacterTextSplitter` - This splitter splits the text into chunks of a given size, and then recursively splits the chunks into smaller chunks until the chunk size is reached. This method is useful for long documents.
@@ -368,13 +367,21 @@ The endpoint for the `crawl` endpoint is pretty straightforward. It simply calls
 ```ts
 import seed from "./seed";
 import { NextResponse } from "next/server";
+import { ServerlessSpecCloudEnum } from "@pinecone-database/pinecone";
 
 export const runtime = "edge";
 
 export async function POST(req: Request) {
   const { url, options } = await req.json();
   try {
-    const documents = await seed(url, 1, process.env.PINECONE_INDEX!, options);
+    const documents = await seed(
+      url,
+      1,
+      process.env.PINECONE_INDEX!,
+      (process.env.PINECONE_CLOUD as ServerlessSpecCloudEnum) || "aws",
+      process.env.PINECONE_REGION || "us-west-2",
+      options
+    );
     return NextResponse.json({ success: true, documents });
   } catch (error) {
     return NextResponse.json({ success: false, error: "Failed crawling" });
@@ -399,8 +406,8 @@ const getMatchesFromEmbeddings = async (embeddings: number[], topK: number, name
   }
 
   // Retrieve the list of indexes to check if expected index exists
-  const indexes = await pinecone.listIndexes()
-  if (indexes.filter(i => i.name === indexName).length !== 1) {
+  const indexes = (await pinecone.listIndexes())?.indexes
+  if (!indexes || indexes.filter(i => i.name === indexName).length !== 1) {
     throw new Error(`Index ${indexName} does not exist`)
   }
 
@@ -560,7 +567,7 @@ The pinecone-vercel-starter uses [Playwright](https://playwright.dev) for end to
 To run all the tests: 
 
 ```
-npm run test:e2e
+pnpm test:e2e
 ```
 
 By default, when running locally, if errors are encountered, Playwright will open an HTML report showing which 
@@ -570,6 +577,6 @@ tests failed and for which browser drivers.
 
 To display the latest test report locally, run: 
 ```
-npm run test:show
+pnpm test:show
 ```
 
